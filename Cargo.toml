@@ -1,0 +1,10 @@
+[package]
+name = "sharded-offset-map"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+description = "A map from u64 to T that can be written from multiple threads"
+repository = "https://github.com/davidlattimore/sharded-offset-map"
+edition = "2021"
+
+[dependencies]
+sharded-vec-writer = "0.2.0"

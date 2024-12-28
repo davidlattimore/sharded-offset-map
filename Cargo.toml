@@ -7,4 +7,4 @@ repository = "https://github.com/davidlattimore/sharded-offset-map"
 edition = "2021"
 
 [dependencies]
-sharded-vec-writer = "0.2.0"
+sharded-vec-writer = "0.3.0"

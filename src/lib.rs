@@ -1,3 +1,5 @@
+use std::mem::take;
+
 // An `OffsetMap` is effectively a `HashMap<u64,T>` but with different performance characteristics.
 // The input space is divided into blocks of size `BLOCK_SIZE`. Each block can map up to 12 input
 // values to output values. If more are needed, it's up to the user to store them elsewhere, e.g. in
@@ -28,24 +30,6 @@ pub struct Block<T, const BLOCK_SIZE: u64> {
     values: [T; 12],
 }
 
-/// The offset of a particular value within a shard. Can be used to update a value some time after
-/// an insertion.
-#[derive(Clone, Copy)]
-pub struct OffsetInShard(u32);
-impl OffsetInShard {
-    fn new(block_index: usize, index_in_block: u8) -> Self {
-        Self(((block_index as u32) << 4) | index_in_block as u32)
-    }
-
-    fn block_index(self) -> usize {
-        (self.0 >> 4) as usize
-    }
-
-    fn index_in_block(self) -> usize {
-        (self.0 & 0xf) as usize
-    }
-}
-
 pub struct ShardedWriter<'map, T, const BLOCK_SIZE: u64> {
     vec_writer: sharded_vec_writer::VecWriter<'map, Block<T, BLOCK_SIZE>>,
     base: u64,
@@ -53,10 +37,17 @@ pub struct ShardedWriter<'map, T, const BLOCK_SIZE: u64> {
 
 pub struct Shard<'map, T, const BLOCK_SIZE: u64> {
     last_key: Option<u64>,
+
+    /// The key at which this shard started.
     base: u64,
-    key_offset: u64,
+
+    block_start: u64,
+
     vec_shard: sharded_vec_writer::Shard<'map, Block<T, BLOCK_SIZE>>,
-    index_in_block: Option<u8>,
+
+    relative_offsets: &'map mut [u8],
+    values: &'map mut [T],
+    used: &'map mut u16,
 }
 
 /// An error that indicates that an insert failed due to the block for the key being full. The
@@ -107,20 +98,25 @@ impl<T: Copy, const BLOCK_SIZE: u64> OffsetMap<T, BLOCK_SIZE> {
 }
 
 impl<'map, T: Default, const BLOCK_SIZE: u64> ShardedWriter<'map, T, BLOCK_SIZE> {
-    /// Take a shard into which writing can occur. `size` must be an exact multiple of `BLOCK_SIZE`.
-    /// Taken shards should be returned in the order they were taken by calling `return_shard`.
+    /// Take a shard into which writing can occur. `size` must be an exact multiple of `BLOCK_SIZE`
+    /// and must not be zero. Taken shards should be returned in the order they were taken by
+    /// calling `return_shard`.
     pub fn take_shard(&mut self, size: u64) -> Shard<'map, T, BLOCK_SIZE> {
         assert_eq!(size % BLOCK_SIZE, 0);
+        assert_ne!(size, 0);
         let num_blocks = size / BLOCK_SIZE;
-        let vec_shard = self.vec_writer.take_shard(num_blocks as usize);
-        let key_offset = self.base;
+        let mut vec_shard = self.vec_writer.take_shard(num_blocks as usize);
+        let base = self.base;
         self.base += size;
+        let block = vec_shard.push(Block::default());
         Shard {
-            base: key_offset,
-            key_offset,
+            base,
+            block_start: base,
             vec_shard,
-            index_in_block: None,
-            last_key: key_offset.checked_sub(1),
+            last_key: base.checked_sub(1),
+            relative_offsets: block.relative_offsets.as_mut_slice(),
+            values: block.values.as_mut_slice(),
+            used: &mut block.used,
         }
     }
 
@@ -130,16 +126,16 @@ impl<'map, T: Default, const BLOCK_SIZE: u64> ShardedWriter<'map, T, BLOCK_SIZE>
     }
 }
 
-impl<T: Default, const BLOCK_SIZE: u64> Shard<'_, T, BLOCK_SIZE> {
+impl<'storage, T: Default, const BLOCK_SIZE: u64> Shard<'storage, T, BLOCK_SIZE> {
     /// Inserts the supplied key-value pair. If the block is already full, then returns an error.
     /// Panics if the supplied key falls outside of the range of the current shard or if its less
     /// than or equal to the last key supplied.
-    pub fn insert(&mut self, key: u64, value: T) -> Result<OffsetInShard, BlockFull> {
+    pub fn insert(&mut self, key: u64, value: T) -> Result<&'storage mut T, BlockFull> {
         if self.last_key.is_some_and(|last_key| last_key >= key) {
-            if key < self.key_offset {
+            if key < self.block_start {
                 panic!(
                     "Key {key} supplied when block starts at {}",
-                    self.key_offset
+                    self.block_start,
                 );
             }
             panic!(
@@ -150,70 +146,62 @@ impl<T: Default, const BLOCK_SIZE: u64> Shard<'_, T, BLOCK_SIZE> {
         }
         self.last_key = Some(key);
 
-        let mut offset_in_block = key - self.key_offset;
-
-        // See if the key is past the end of the current block.
-        while offset_in_block >= BLOCK_SIZE {
-            if self.index_in_block.take().is_none() {
+        let mut relative_offset = (key - self.block_start) as usize;
+        let blocks_to_take = relative_offset / BLOCK_SIZE as usize;
+        if blocks_to_take > 0 {
+            // We may have some completely empty blocks that we just skip over.
+            let blocks_to_skip = blocks_to_take.saturating_sub(1);
+            for _ in 0..blocks_to_skip {
                 self.vec_shard.push(Block::default());
             }
-            offset_in_block -= BLOCK_SIZE;
-            self.key_offset += BLOCK_SIZE;
+
+            // Set up the new block into which we're going to write.
+            let block = self.vec_shard.push(Block::default());
+            self.values = &mut block.values;
+            self.relative_offsets = &mut block.relative_offsets;
+            self.used = &mut block.used;
+            relative_offset %= BLOCK_SIZE as usize;
+            self.block_start += blocks_to_take as u64 * BLOCK_SIZE;
         }
 
-        // Compute which index in our block we'll be writing to.
-        let index_in_block = self.index_in_block.unwrap_or_else(|| {
-            if self.vec_shard.try_push(Block::default()).is_err() {
-                panic!(
-                    "Tried to insert key {key} beyond end of shard {}",
-                    self.base + self.vec_shard.len() as u64 * BLOCK_SIZE
-                );
-            }
-            0
-        });
-
-        if index_in_block == MAX_KEYS_PER_BLOCK {
+        if self.values.is_empty() {
             return Err(BlockFull);
         }
 
-        let i = usize::from(index_in_block);
+        let values = take(&mut self.values);
+        let (value_out, rest) = values.split_at_mut(1);
+        value_out[0] = value;
+        self.values = rest;
 
-        let init_blocks = self.vec_shard.init_mut();
-        let block = init_blocks.last_mut().unwrap();
+        let relative_offsets = take(&mut self.relative_offsets);
+        relative_offsets[0] = relative_offset as u8;
+        self.relative_offsets = &mut relative_offsets[1..];
 
-        block.used |= 1 << index_in_block;
-        block.relative_offsets[i] = offset_in_block as u8;
-        block.values[i] = value;
+        let index_in_block = MAX_KEYS_PER_BLOCK - self.values.len() as u8 - 1;
+        *self.used |= 1 << index_in_block;
 
-        let offset = OffsetInShard::new(init_blocks.len() - 1, index_in_block);
-
-        self.index_in_block = Some(index_in_block + 1);
-
-        Ok(offset)
-    }
-
-    pub fn get_mut(&mut self, offset: OffsetInShard) -> &mut T {
-        &mut self.vec_shard.init_mut()[offset.block_index()].values[offset.index_in_block()]
-    }
-
-    /// Returns an iterator over values that have already been written to this shard.
-    pub fn iter_mut(&mut self) -> ShardIterMut<T, BLOCK_SIZE> {
-        let mut iter = ShardIterMut {
-            base: self.base,
-            blocks: self.vec_shard.init_mut(),
-            used: 0,
-            relative_offsets: &[],
-            values: &mut [],
-        };
-        iter.consume_block();
-        iter
+        Ok(&mut value_out[0])
     }
 
     /// Consume the remainder of the space allocated to this writer. This needs to be called prior
     /// returning the shard to the `VecWriter`.
     pub fn finish(&mut self) {
         while self.vec_shard.try_push(Block::default()).is_ok() {}
-        self.key_offset = u64::MAX;
+        self.values = &mut [];
+    }
+
+    /// Returns the base key of this shard.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Returns the length of this shard.
+    pub fn len(&self) -> u64 {
+        self.vec_shard.len() as u64 * BLOCK_SIZE
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -282,24 +270,12 @@ mod tests {
         let shard_size = if multi_shards { 256 } else { 1024 };
         let mut shard = writer.take_shard(shard_size);
 
-        let mut inserted = Vec::new();
-
         for (key, value) in present {
             while *key >= shard.base + shard_size {
-                let init: Vec<_> = shard.iter_mut().map(|(key, value)| (key, *value)).collect();
-                assert_eq!(inserted, init);
-                inserted.clear();
-
                 writer.return_shard(shard);
                 shard = writer.take_shard(shard_size);
             }
             shard.insert(*key, *value).unwrap();
-            inserted.push((*key, *value));
-        }
-
-        if !multi_shards {
-            let init: Vec<_> = shard.iter_mut().map(|(key, value)| (key, *value)).collect();
-            assert_eq!(present, init);
         }
 
         writer.return_shard(shard);

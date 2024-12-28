@@ -11,6 +11,6 @@ dependencies = [
 
 [[package]]
 name = "sharded-vec-writer"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa30d139ce17f555778e4686d94f02cb2d745693d2b72d87946b14157ba74bfb"
+checksum = "b0e1e51ad52f9ead5d806e61860fd595da6c76f061a6324bd13aa4f437a29681"

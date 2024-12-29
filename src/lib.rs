@@ -4,7 +4,7 @@ use std::mem::take;
 // The input space is divided into blocks of size `BLOCK_SIZE`. Each block can map up to 12 input
 // values to output values. If more are needed, it's up to the user to store them elsewhere, e.g. in
 // an actual hashmap. `T` should ideally be the size of a `u32`, otherwise a block won't fit neatly
-// in a cache line and performance might be degraded.
+// in a cache line and performance might be degraded. `BLOCK_SIZE` can be at most 256.
 #[derive(Default)]
 pub struct OffsetMap<T, const BLOCK_SIZE: u64> {
     blocks: Vec<Block<T, BLOCK_SIZE>>,
@@ -70,6 +70,10 @@ impl<T: Copy, const BLOCK_SIZE: u64> OffsetMap<T, BLOCK_SIZE> {
 
     /// Start a write. Keys in the final map will range from 0 to `keyspace_size - 1`.
     pub fn start_sharded_write(&mut self, keyspace_size: u64) -> ShardedWriter<T, BLOCK_SIZE> {
+        assert!(
+            BLOCK_SIZE <= 256,
+            "Block sizes larger than 256 are not currently supported"
+        );
         assert_eq!(keyspace_size % BLOCK_SIZE, 0);
         // For now, performing multiple writes is not supported.
         assert_eq!(self.blocks.capacity(), 0);

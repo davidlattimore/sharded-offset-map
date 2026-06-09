@@ -69,7 +69,7 @@ impl<T: Copy, const BLOCK_SIZE: u64> OffsetMap<T, BLOCK_SIZE> {
     }
 
     /// Start a write. Keys in the final map will range from 0 to `keyspace_size - 1`.
-    pub fn start_sharded_write(&mut self, keyspace_size: u64) -> ShardedWriter<T, BLOCK_SIZE> {
+    pub fn start_sharded_write(&mut self, keyspace_size: u64) -> ShardedWriter<'_, T, BLOCK_SIZE> {
         assert!(
             BLOCK_SIZE <= 256,
             "Block sizes larger than 256 are not currently supported"

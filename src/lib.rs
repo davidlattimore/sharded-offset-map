@@ -56,6 +56,7 @@ pub struct Shard<'map, T, const BLOCK_SIZE: u64> {
 pub struct BlockFull;
 
 impl<T: Copy, const BLOCK_SIZE: u64> OffsetMap<T, BLOCK_SIZE> {
+    #[inline(always)]
     pub fn get(&self, key: u64) -> Option<T> {
         let block_index = key / BLOCK_SIZE;
         let offset_in_block = (key % BLOCK_SIZE) as u8;
